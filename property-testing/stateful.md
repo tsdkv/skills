@@ -7,8 +7,11 @@ against the system and a trivial model.
 
 - `actions[""]` is the invariant check, run before and after every action.
   Put only checks in it.
-- `t.Skip` inside an action is a precondition; rapid retries up to 100 times
-  to find a non-skipped action.
+- `t.Skip` inside an action can express a precondition; rapid retries up to
+  100 times to find a non-skipped action. Measure skips and ensure progress.
+  Skip only unavailable model actions, not specified invalid-operation
+  behavior: an empty-stack pop may be unavailable to a successful-pop action
+  while needing a separate action that checks its promised error behavior.
 - `rapid.StateMachineActions(sm)` builds the map from the methods of a type
   with a `Check(*rapid.T)` method (each other method `Name(*rapid.T)` is an
   action).
@@ -22,11 +25,30 @@ ops append to a slice of live handles, consuming ops `SampledFrom` it. That
 makes a merge of two merged heaps — a failure no human would construct —
 reachable.
 
+## Isolation and replay
+
+Allocate fresh SUT and model state inside the property callback for every
+invocation, including shrink attempts. Mutable state captured outside it
+leaks between cases. Model and SUT must not share backing arrays or mutable
+objects: otherwise implementation mutations can silently change expectations.
+
+Control clocks, randomness, external services, environment, and background
+workers; capture all nondeterministic choices needed to replay an execution.
+Stop and join workers before the callback returns, including failure paths.
+Use observable completion or controlled scheduling, not sleeps, to establish
+that asynchronous work finished. A seed can reproduce inputs without
+reproducing the thread schedule that triggered a race.
+
+Stabilize map iteration when it determines draw order, operation order, or
+other replay-relevant choices. Merely checking every member or copying keys
+into a model map does not inherently require sorting.
+
 ## Complete example
 
 A sorted-slice set as the system, `map[int]bool` as the model, a pool of
-live sets, an invariant in `""`. Compiles and passes against rapid v1.3.0;
-planting a dedup bug in `Add` fails it with a two-action counterexample.
+live sets, an invariant in `""`. Compare complete contents after every action:
+wrong members, duplicates, and ordering defects must all fail. `slices.Equal`
+treats nil and empty slices alike, matching this set's empty-set semantics.
 
 ```go
 package ex
@@ -106,8 +128,13 @@ func TestIntSetModel(t *testing.T) {
 			},
 			"": func(rt *rapid.T) { // invariant, before and after every action
 				for _, p := range pool {
-					if !sort.IntsAreSorted(p.sys.xs) || len(p.sys.xs) != len(p.model) {
-						rt.Fatalf("invariant broken: %v vs model %v", p.sys.xs, p.model)
+					want := make([]int, 0, len(p.model))
+					for x := range p.model {
+						want = append(want, x)
+					}
+					sort.Ints(want)
+					if !slices.Equal(p.sys.xs, want) {
+						rt.Fatalf("contents: got %v, want %v", p.sys.xs, want)
 					}
 				}
 			},
@@ -118,8 +145,14 @@ func TestIntSetModel(t *testing.T) {
 
 ## When `Repeat` is not enough
 
-`Repeat` cannot express parallel batches. For serializability checking, draw
-an op slice (`prefix`, `branchA`, `branchB`) and replay by hand (below).
+`Repeat` cannot express parallel batches. For concurrency checking, draw
+op slices (`prefix`, `branchA`, `branchB`) and replay by hand (below).
+Interleaving checks must match the promised consistency model.
+Linearizability additionally respects real-time ordering of non-overlapping
+operations: record invocation and completion events to enforce that order.
+Transactional serializability requires modeling transaction boundaries and
+checking equivalence to a serial transaction order, not just any operation
+interleaving. Record and enforce the API's actual constraints.
 
 ## Patterns for harder systems
 
@@ -144,17 +177,19 @@ ShardStore):
   return wrong data. Run the suite with and without injection.
 - **Flaky failures count.** Repeat each candidate (3× while searching, 20×
   while shrinking) and fail if any repetition fails.
-- **Serializability via interleaving search.** Run a sequential prefix, then
-  two op batches in parallel, then search for any interleaving of the
-  parallel results consistent with the model; none ⇒ definite bug. Two
-  branches suffice for most bugs and keep the search feasible (~10k
-  interleavings for 16 ops). Validate the model sequentially first. When
-  shrinking, move ops from the parallel branches into the prefix wherever
-  possible, so the counterexample is *minimally parallel*: what stays
-  parallel truly races.
-- **Determinism is a feature you build.** Go randomizes map iteration;
-  iterating a map inside a property makes runs non-reproducible and defeats
-  shrinking. Sort keys first.
+- **Contract-aware interleaving search.** Run a sequential prefix, then two
+  op batches in parallel. Search for an ordering consistent with the model,
+  observations, and the contract's ordering/transaction constraints above.
+  If an exhaustive search finds none, the history violates that model;
+  exhausting a search budget is inconclusive. Two branches keep exploration
+  feasible (~10k interleavings for two eight-op sequences), but cannot expose
+  bugs requiring more participants. Validate the model sequentially first.
+  When shrinking, try moving ops into the prefix while retaining the failure;
+  the remaining parallelism is a small witness, not proof that every retained
+  operation truly races.
+- **Determinism is a feature you build.** Stabilize map order when it affects
+  draws, operations, or replay choices; member-only checks need no sorting.
+  Case isolation and controlled scheduling matter too (see above).
 - **Deterministic simulation.** Single-thread the core, inject seeded
   randomness and fake clock/network/disk so every failure replays from a
   seed. Unit-test-scale version: a user-level scheduler whose decisions come

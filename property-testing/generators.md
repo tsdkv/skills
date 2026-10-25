@@ -3,9 +3,9 @@
 ## Test the generator
 
 If a generator builds values via the code under test (folding `insert` to
-build a tree), a bug in the code poisons the generator, and every property
-drawing from it fails as a false positive. Write one property asserting
-every drawn value satisfies the datatype invariant:
+build a tree), an invalid result can come from the generator, implementation,
+or assumed invariant. Write one property asserting every drawn value
+satisfies the datatype invariant:
 
 ```go
 rapid.Check(t, func(rt *rapid.T) {
@@ -16,8 +16,16 @@ rapid.Check(t, func(rt *rapid.T) {
 })
 ```
 
-If this fails, fix the generator before reading any other failure. Because
-rapid shrinks inside the generator, this also covers shrink validity.
+If this fails, determine which contract was violated:
+
+- The generator violated a constructor precondition: fix the generator.
+- The constructor violated its contract on valid inputs: fix the
+  implementation. Valid inserts producing an invalid tree are a real bug.
+- The invariant or assumed contract is wrong: fix the test specification.
+
+Fix the responsible component; do not repair generated values in a way that
+hides implementation bugs. Because rapid shrinks inside the generator, this
+property also checks validity of the values produced during shrinking.
 
 ## How rapid shrinks
 

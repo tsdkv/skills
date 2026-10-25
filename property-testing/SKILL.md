@@ -12,9 +12,13 @@ are the honest answer.
 
 ## Procedure
 
-1. **Pick the strongest property the code supports** (catalog below).
-2. **Build the generator by construction** — no filters, no `Skip`.
-3. **Write the property; label every `Draw`.**
+1. **Define the contract:** valid domain, observable guarantees, equivalence
+   relation, and permitted side effects. Separate guarantees from accidents.
+2. **Select complementary properties** (catalog below).
+3. **Write the generator and property; label every `Draw`.** Prefer
+   construction over rejection. Stateful preconditions may skip unavailable
+   actions; measure skips and ensure progress. Test specified invalid-operation
+   behavior rather than skipping it.
 4. **REQUIRED: plant a bug and confirm the property fails. Revert.**
    Flip a comparison or drop a branch. Still passes → the property or
    generator is blind; fix it before trusting either.
@@ -23,21 +27,31 @@ are the honest answer.
    `collect`). Reshape the generator until the interesting regime dominates.
 6. **Commit `testdata/rapid/`.**
 
+## Contract and equality
+
+Define `==` before using it: roundtrips may preserve meaning rather than
+representation. Specify float edge cases and collection semantics. Rejection
+does not promise rollback; correct results do not prove input preservation.
+Check side effects against the API's guarantees. Details: `contracts.md`.
+
 ## Property catalog
 
-Strongest first. Assert the highest rung the code supports; "no crash"
-alone rarely justifies a property test.
+Use this as a selection aid, not a ranking. Prefer an independent reference
+or simple model when available; a model that repeats the implementation can
+share its bugs. Combine agreement, structural invariants, error behavior,
+and input preservation. Roundtrips establish consistency, not independent
+conformance to a specification. "No crash" alone is usually insufficient.
 
 | Property | Formula | Applies to |
 |---|---|---|
-| Model-based | `abstract(f(x)) == fModel(abstract(x))` | A simple model stands in for the system (sorted slice for a tree, `map` for a cache). Strongest bug-finder |
+| Model-based | `abstract(f(x)) == fModel(abstract(x))` | An independent, simple model (sorted slice for a tree, `map` for a cache) |
 | Oracle | `new(x) == reference(x)` | Optimization, reimplementation, brute force vs. fast path |
 | Roundtrip / inverse | `decode(encode(x)) == x` | Codecs, wire/disk formats, compress, apply/undo |
 | Postcondition | relation between args and result | Inputs built with known outcome: `find k (insert k v t) == v` |
 | Easy to verify | `check(result(x))` | Hard to compute, cheap to check |
 | Idempotence | `f(f(x)) == f(x)` | Normalization, dedup, retry, reopen |
 | Invariant | holds before and after | Sortedness, counts, internal structure |
-| Error rejection | `f(invalid)` errors cleanly | Parsers, validators: error, no panic, no partial state |
+| Error rejection | `f(invalid)` rejects as specified | Parsers, validators: error/no panic when promised; rollback only for atomic failure |
 | Algebraic laws | commutative, associative, identity | Only when the structure is really there |
 
 No oracle? See `metamorphic.md`. When representation is incidental (tree
@@ -62,9 +76,9 @@ two independent draws are almost never equivalent.
 | `IntRange` + indexing to pick from a set | `SampledFrom` |
 | `SliceOfN(g, 1, 50)` as if 50 were reachable | `SliceOfN(g, n, n)`, or `SampledFrom` over size regimes |
 | Filter / `Skip` rejects most inputs | Generate by construction |
-| Map iteration inside the property | Sort keys |
+| Map order determines draws, operations, or replay choices | Stabilize order; member-only checks need no sorting |
 | Property recomputes the implementation | Constrain, don't recompute |
-| Only "no crash" asserted | Climb the catalog |
+| Only "no crash" asserted | Add contract-backed, complementary properties |
 | Related inputs drawn independently | Correlate (reuse existing keys) |
 | Property has never failed | Mutation check (step 4) |
 | Generator builds values via the code under test | Add a generator-validity property (`generators.md`) |
@@ -95,17 +109,20 @@ n := rapid.IntRange(0, 100).Draw(rt, "n")
 k := rapid.IntRange(-5, n+5).Draw(rt, "k") // k < n actually happens
 scores := rapid.SliceOfN(scoreGen, n, n).Draw(rt, "scores")
 
-// correlate: decide hit/miss first, then draw
+// correlate: choose an existing key or an arbitrary key (not a guaranteed miss)
 var k int
 if len(keys) > 0 && rapid.Bool().Draw(rt, "hit") {
     k = rapid.SampledFrom(keys).Draw(rt, "kExisting")
 } else {
-    k = rapid.IntRange(0, 100).Draw(rt, "kFresh")
+    k = rapid.IntRange(0, 100).Draw(rt, "kArbitrary")
 }
 ```
 
-Keep the miss case reachable. For several scale regimes (10 / 1k / 100k),
-`SampledFrom` over the regimes — no default generator visits the large ones.
+Deliberately reach both hits and misses: the arbitrary branch can hit too.
+For guaranteed misses in a finite domain, draw from its absent keys; if none
+remain, generate a non-full structure or test that full-domain case separately.
+For several scale regimes (10 / 1k / 100k), `SampledFrom` over the regimes —
+no default generator visits the large ones.
 Shrinking, swarm configurations, and generator validity: `generators.md`.
 
 ## Stateful, concurrent, and eventually consistent code
@@ -116,6 +133,13 @@ failure-injection, and serializability patterns: `stateful.md`.
 
 ## Running and replaying
 
+- Start every property invocation, including shrink attempts, from fresh
+  state. Keep model and SUT mutable data separate; stop and join background
+  workers before returning. See `stateful.md` for isolation pitfalls.
+- Control clocks, randomness, services, environment, and scheduling; capture
+  all nondeterministic choices needed for replay. A seed reproduces generated
+  inputs, not necessarily a failing thread schedule. Observe completion,
+  rather than treating sleeps as proof that asynchronous work finished.
 - Budget like a unit test: cheap in CI, raise `-rapid.checks` nightly.
 - Failures print the exact replay flag (`-rapid.failfile=...` or
   `-rapid.seed=N`); rerun with it. `-rapid.v` shows all draws.
@@ -125,24 +149,28 @@ failure-injection, and serializability patterns: `stateful.md`.
 
 ## Interpreting failures
 
-rapid shrinks to a minimal counterexample and writes it under
-`testdata/rapid/` — commit it. Then decide:
+rapid shrinks a failing case and writes it under `testdata/rapid/` — commit
+it. Diagnose against the contract, not the size of the witness:
 
-- **Wrong property** — the counterexample is legitimate input the property
-  never covered. Fix the property or generator, not the code.
-- **Wrong model** — a precondition fails during replay, or the model
-  disagrees with clearly reasonable behavior.
-- **Wrong code** — the counterexample is minimal and clearly valid. Paste it
+- **Wrong property or generator** — the assertion imposes an unpromised
+  guarantee, or generated inputs violate a precondition. Fix the responsible
+  test component; valid inputs exposing a contract violation are real bugs.
+- **Wrong model or replay setup** — check model assumptions and case isolation
+  when a precondition fails during replay; reasonable-looking behavior alone
+  does not establish which side is right.
+- **Wrong code** — valid inputs expose a violated guarantee. Paste the case
   into a unit test only to lock a real regression.
 
-After the first fix, keep running: one property routinely finds several
-distinct bugs. Read the shrunk case precisely — what it *doesn't* contain
-is information (no two equal values ⇒ distinctness is required). Residual
-boilerplate is the generator's floor; the same bug shrinking to the same
-case every time is normalization, a feature.
+Treat the shrunk case as a small witness, not a global minimum or proof of
+necessity. Absent features are unnecessary for this reproduction: no duplicate
+values means duplicates are not needed, not that distinctness is required.
+Test nearby variants before attributing the bug to remaining features. After
+the first fix, keep running: one property can find several distinct bugs.
+Residual boilerplate may be the generator's floor.
 
 ## Supporting files
 
+- `contracts.md` — valid domains, equality, side effects, oracle independence
 - `stateful.md` — `Repeat`, example, crash/fault/serializability patterns
 - `generators.md` — shrinking mechanics, generator validity, swarm testing
 - `metamorphic.md` — relation families when no oracle exists
