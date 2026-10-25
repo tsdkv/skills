@@ -9,8 +9,9 @@ then the body.
 ## Skills
 
 - **property-testing** — property-based tests in Go with rapid: what property
-  to assert (roundtrips, oracles, metamorphic relations) and how to shape
-  rapid's biased generators.
+  to assert (roundtrips, oracles, metamorphic relations), how to shape
+  rapid's biased generators, and how to test stateful, concurrent, and
+  eventually consistent systems against a model with `Repeat`.
 
 ## Installation
 
